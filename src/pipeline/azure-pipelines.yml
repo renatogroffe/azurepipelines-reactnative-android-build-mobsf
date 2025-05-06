@@ -1,0 +1,273 @@
+trigger:
+- main
+
+variables:
+  vmImageName: 'ubuntu-latest'
+  vmImageNameBuild: 'macos-latest'
+  projectPath: './src/AppGroffe'
+  apkFilePath: 'android/app/build/outputs/apk/release'
+  BUILD_FILE: 'app-release.apk'
+  MOBSF_PDF_FILE: 'mobsf-report.pdf'
+  MOBSF_JSON_FILE: 'mobsf-report.json'
+  MOBSF_SARIF_FILE: 'mobsf-report.sarif'
+  MOBSF_API_KEY: 'githubactionskey'
+
+stages:
+- stage: BuildAndroidStage
+  displayName: Build Android Stage
+  jobs:
+  - job: BuildAndroid
+    displayName: Build Android
+    pool:
+      vmImage: $(vmImageNameBuild)
+    steps:
+    - script: sw_vers -productVersion
+      displayName: 'Exibir a versao atual do macOS'
+    - task: JavaToolInstaller@0
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+      displayName: 'Configurar uso do Java 17'
+    - script: |
+        cd $(projectPath)
+        npm install
+      displayName: 'Instalar dependencias via npm install'
+    - task: Gradle@3
+      inputs:
+        gradleWrapperFile: '$(projectPath)/android/gradlew'
+        workingDirectory: '$(projectPath)/android'
+        tasks: 'assembleRelease'
+        publishJUnitResults: true
+        testResultsFiles: '**/TEST-*.xml'
+        javaHomeOption: 'JDKVersion'
+        gradleOptions: '-Xmx2048m'
+        sonarQubeRunAnalysis: false
+        spotBugsAnalysis: false
+      displayName: 'Build do App Android com Gradle'
+    - script: |
+        cd $(projectPath)
+        cd $(apkFilePath)
+        echo 'Diretorio com o resultado do build:'
+        pwd
+        echo ''
+        echo 'Arquivos gerados:'
+        ls
+      displayName: 'Listar apk gerado'
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(projectPath)/$(apkFilePath)/$(BUILD_FILE)'
+        artifact: 'apk-appgroffe'
+        publishLocation: 'pipeline'
+      displayName: 'Publicar apk como Artifact'
+- stage: SecurityScanStage
+  displayName: Security Scan Stage
+  dependsOn: BuildAndroidStage
+  jobs:
+  - job: SecurityScan
+    displayName: Security Scan
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: cat /etc/os-release
+      displayName: 'Exibir a versao atual do Ubuntu'
+    - script: docker pull opensecurity/mobile-security-framework-mobsf:latest
+      displayName: 'Baixar imagem do Mobile Security Framework'     
+    - script: docker images
+      displayName: 'Exibir imagens de containers no ambiente'
+    - script: docker run -it --rm -e "MOBSF_API_KEY=$(MOBSF_API_KEY)" -p 8000:8000 -d opensecurity/mobile-security-framework-mobsf:latest
+      displayName: 'Criar container do Mobile Security Framework'
+    - script: docker container ls
+      displayName: 'Exibir containers em execucao'
+    - script: sleep 40s
+      displayName: 'Aguardar 40 segundos para a subida do container do MobSF'
+    - script: |
+        mkdir build
+        cd build
+      displayName: 'Criar diretorio /build'
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        buildType: 'current'
+        artifactName: 'apk-appgroffe'
+        targetPath: './build'
+      displayName: 'Baixar .apk do artefato'
+    - pwsh: |
+        $url = 'http://localhost:8000/api/v1/upload'
+        $headers = @{"X-Mobsf-Api-Key" = "$(MOBSF_API_KEY)"}
+        cd build
+        echo 'Arquivos em /build'
+        echo ''
+        pwd
+        echo ''
+        ls -l
+        echo ''
+        echo 'Efetuando upload do arquivo de build para o MobSF...'
+        $response = Invoke-WebRequest -Uri $url -Method Post -Form @{file = Get-Item -Path "./$(BUILD_FILE)"} -Headers $headers -ContentType 'multipart/form-data'
+        echo $response
+        echo $response.Content
+        $http_code = $response.StatusCode
+        if ($http_code -ne 200) {
+          echo "Upload falhou com código de status HTTP $http_code"
+          exit 1
+        } else {
+          echo "Upload bem-sucedido - Código do status HTTP $http_code"
+          $hash = ($response.Content | ConvertFrom-Json).hash
+          Write-Host "##vso[task.setvariable variable=HASH_BUILD_FILE]$hash"
+        }
+      displayName: 'Efetuar upload do arquivo de build para o MobSF'
+    - pwsh: echo "O hash é $(HASH_BUILD_FILE)"
+      displayName: 'Testando a variavel de ambiente com o hash do arquivo de build'
+    - pwsh: |
+        $url = 'http://localhost:8000/api/v1/scan'
+        $headers = @{"X-Mobsf-Api-Key" = "$(MOBSF_API_KEY)"}
+        $response = Invoke-WebRequest -Uri $url -Method Post -Form @{hash = "$(HASH_BUILD_FILE)"} -Headers $headers -ContentType 'multipart/form-data'
+        echo $response
+        $http_code = $response.StatusCode
+        if ($http_code -ne 200) {
+          echo "Scan falhou com código de status HTTP $http_code"
+          exit 1
+        } else {
+          echo "Scan bem-sucedido - Código do status HTTP $http_code"
+        }
+      displayName: 'Enviar requisicao para o endpoint de scan'
+    - pwsh: |
+        $url = 'http://localhost:8000/api/v1/download_pdf'
+        $headers = @{"X-Mobsf-Api-Key" = "$(MOBSF_API_KEY)"}
+        $response = Invoke-WebRequest -Uri $url -Method Post -Headers $headers -Form @{hash = "$(HASH_BUILD_FILE)"} -ContentType 'multipart/form-data'
+        echo $response
+        $http_code = $response.StatusCode
+        if ($http_code -ne 200) {
+          echo "Download de relatorio .pdf falhou com código de status HTTP $http_code"
+          exit 1
+        } else {
+          echo "Download de relatorio .pdf bem-sucedido - Código do status HTTP $http_code"
+          [System.IO.File]::WriteAllBytes('$(MOBSF_PDF_FILE)', $response.Content)
+        }
+      displayName: 'Enviar requisicao para o endpoint de PDF'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(MOBSF_PDF_FILE)'
+        ArtifactName: 'MobSF-Security'
+        publishLocation: 'Container'
+      displayName: 'Publicacao do relatorio PDF do MobSF com resultados da analise'
+    - pwsh: |
+        $url = 'http://localhost:8000/api/v1/scorecard'
+        $headers = @{"X-Mobsf-Api-Key" = "$(MOBSF_API_KEY)"}
+        $response = Invoke-WebRequest -Uri $url -Method Post -Headers $headers -Form @{hash = "$(HASH_BUILD_FILE)"} -ContentType 'multipart/form-data'
+        echo $response
+        $http_code = $response.StatusCode
+        if ($http_code -ne 200) {
+          echo "Download de relatorio .json falhou com código de status HTTP $http_code"
+          exit 1
+        } else {
+          echo "Download de relatorio .json bem-sucedido - Código do status HTTP $http_code"
+          $response.Content | Set-Content -Path '$(MOBSF_JSON_FILE)'
+        }
+      displayName: 'Enviar requisicao para o endpoint de Scorecard/JSON'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(MOBSF_JSON_FILE)'
+        ArtifactName: 'MobSF-Security'
+        publishLocation: 'Container'
+      displayName: 'Publicacao do relatorio Scorecard (JSON) do MobSF com resultados da analise'
+    - pwsh: |
+        $data = Get-Content -Path $(MOBSF_JSON_FILE) | ConvertFrom-Json
+
+        $sarif = @{
+            version = "2.1.0"
+            runs = @(
+                @{
+                    tool = @{
+                        driver = @{
+                            name = "MobSF"
+                            version = $data.version
+                            informationUri = "https://github.com/MobSF/Mobile-Security-Framework-MobSF"
+                            rules = @()
+                        }
+                    }
+                    results = @()
+                }
+            )
+        }
+
+        function AddResult {
+            param (
+                $level,
+                $issue
+            )
+            $sarif.runs[0].results += @{
+                ruleId = $issue.title
+                level = $level
+                message = @{
+                    text = $issue.description
+                }
+                locations = @(
+                    @{
+                        physicalLocation = @{
+                            artifactLocation = @{
+                                uri = $data.file_name
+                            }
+                            region = @{
+                                startLine = 1
+                            }
+                        }
+                    }
+                )
+            }
+        }
+
+        foreach ($issue in $data.high) {
+            AddResult -level "error" -issue $issue
+        }
+
+        foreach ($issue in $data.warning) {
+            AddResult -level "warning" -issue $issue
+        }
+
+        foreach ($issue in $data.info) {
+            AddResult -level "note" -issue $issue
+        }
+
+        foreach ($issue in $data.secure) {
+            AddResult -level "warning" -issue $issue
+        }
+
+        foreach ($issue in $data.hotspot) {
+            AddResult -level "warning" -issue $issue
+        }
+
+        $sarifJson = $sarif | ConvertTo-Json -Depth 10
+        $sarifJson | Out-File -FilePath $(MOBSF_SARIF_FILE) -Encoding utf8
+
+        # $sarif | ConvertTo-Json -Depth 10 | Set-Content -Path $(MOBSF_SARIF_FILE)
+
+        echo "Conversao dos resultados de JSON para SARIF concluida com sucesso!"
+      displayName: 'Converter relatorio JSON do MobSF para formato SARIF'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(MOBSF_SARIF_FILE)'
+        ArtifactName: 'CodeAnalysisLogs'
+        publishLocation: 'Container'
+      displayName: 'Publicacao de relatorio SARIF'
+    - pwsh: |
+        $sarif = Get-Content -Path $(MOBSF_SARIF_FILE) | ConvertFrom-Json
+        $errors = $sarif.runs.results | Where-Object { $_.level -eq 'error' }
+        if ($errors.Count -gt 0) {
+            Write-Host "***** Vulnerabilidades de nível HIGH no relatório SARIF:"
+            $errors | ForEach-Object { Write-Host $_.message.text }
+            exit 1
+        } else {
+            Write-Host "Nenhuma vulnerabilidade de nível HIGH foi encontrada."
+        }
+      displayName: 'Verificar vulnerabilidades de nivel HIGH no relatorio SARIF'
+- stage: SimulationDeploymentStage
+  displayName: Simulation Deployment Stage
+  dependsOn: SecurityScanStage
+  jobs:
+  - job: SimulationDeploymentStage
+    displayName: Simulation Deployment
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: echo 'Nao foram encontradas vulnerabilidades serias no app!'
+      displayName: 'Testes' 
